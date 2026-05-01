@@ -135,6 +135,7 @@ struct global_history {
 template<u64 F>
 struct folded_gh {
     static_assert(F!=0);
+    // F = Number of bits in Folded GH
 
     reg<F> folded; // initial value = 0 (consistent with global history)
 
