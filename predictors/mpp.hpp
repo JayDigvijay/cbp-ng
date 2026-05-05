@@ -15,14 +15,21 @@ template<
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
     u64 LOGTABLE = 13,  // 32KB hashed perceptron for P2
     u64 LOGP1    = 14,  // 4KB gshare for P1
-    u64 GHIST1   = 6    // P1 gshare history length
+    u64 GHIST1   = 6,   // P1 gshare history length
+    
+    // Novel features parameters
+    u64 IMLI_BITS = 8,
+    u64 MODULUS   = 4,
+    u64 RECENCY_DEPTH = 8,
+    u64 BLURRY_SHIFT = 4,
+    u64 ACYCLIC_SIZE = 16
 >
 struct mpp : predictor {
     static_assert(LOGLB >= 2);
     static constexpr u64 LOGLINEINST = LOGLB - 2; // 4B instruction
 
     static constexpr u64 LINEINST = 1ull << LOGLINEINST;
-    static constexpr u64 NUMHIST = NTABLES - 1; // number of tables using history
+    static constexpr u64 NUMHIST = 8; // number of tables using history, same as hashed perceptron
 
     static constexpr u64 YBITS  = WBITS + std::bit_width(NTABLES-1);
     static constexpr u64 TCBITS = 4; // corresponds to SPEED = 16
@@ -36,6 +43,22 @@ struct mpp : predictor {
 
     geometric_folds<NUMHIST, MINHIST, MAXHIST, index2_bits> gfolds;
     reg<1> true_block = 1;
+
+    // ---- Novel Features State ----
+    reg<IMLI_BITS> imli_counter = 0;
+    // Declared is_forward_table as rwram to support simultaneous read and write in the same cycle
+    rwram<1, 1024, 2> is_forward_table {"imli_forward"};
+    
+    arr<reg<64>, RECENCY_DEPTH> recency_stack;
+    reg<64> last_region = 0;
+    
+    reg<64> mod_history = 0;
+    reg<64> mod_path = 0;
+    
+    // Declared acyclic_table as rwram to support simultaneous read and write in the same cycle
+    rwram<1, ACYCLIC_SIZE, 2> acyclic_table {"acyclic"};
+    reg<64> blurry_path_history = 0;
+    reg<64> current_line_pc = 0;
 
     // ---- for P1 (gshare) ----
     reg<GHIST1> global_history1;
@@ -67,17 +90,22 @@ struct mpp : predictor {
 
     void new_block(val<64> inst_pc)
     {
-        val<LOGLINEINST> offset = inst_pc.fo1() >> 2;
+        // Removed .fo1() because inst_pc was fanned out inside predict1
+        val<LOGLINEINST> offset = inst_pc >> 2;
         block_entry = offset.fo1().decode().concat();
         block_entry.fanout(hard<4*LINEINST>{});
         block_size = 1;
+        // inst_pc is fanned out and can be read a second time here without .fo1()
+        current_line_pc = (inst_pc >> LOGLB) << LOGLB;
     }
 
     val<1> predict1(val<64> inst_pc)
     {
-        inst_pc.fanout(hard<2>{});
+        // Fanout is fanned to 3: 2 for new_block and 1 for predict1 lineaddr
+        inst_pc.fanout(hard<3>{});
         new_block(inst_pc);
 
+        // Using inst_pc directly because it is fanned out
         val<std::max(index1_bits, GHIST1)> lineaddr = inst_pc >> LOGLB;
         global_history1.fanout(hard<2>{});
         if constexpr (GHIST1 <= index1_bits) {
@@ -104,20 +132,67 @@ struct mpp : predictor {
 
     val<1> predict2(val<64> inst_pc)
     {
-        val<index2_bits> lineaddr = inst_pc.fo1() >> LOGLB;
+        // Fanout pc for loop iter counters, recency stack, index, and acyclic features
+        inst_pc.fanout(hard<RECENCY_DEPTH + 2>{});
+        for (u64 i=0; i<RECENCY_DEPTH; i++) {
+            // Each element in the recency stack is fanned out for comparisons and hashing
+            recency_stack[i].fanout(hard<2>{});
+        }
+        
+        // Used inst_pc directly instead of .fo1() because it is already fanned out
+        val<index2_bits> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<NTABLES>{});
+        mod_history.fanout(hard<2>{});
+        mod_path.fanout(hard<2>{});
         gfolds.fanout(hard<2>{});
-
-        for (u64 i=0; i<NTABLES; i++) {
+        
+        // 1. Bimodal / Global History (Original Hashed Perceptron style for first 8 tables)
+        for (u64 i=0; i<NUMHIST; i++) {
             if (i == 0) {
                 index2[i] = lineaddr;
             } else {
-                // Rotate history hash to provide different perspectives
                 auto h = gfolds.template get<0>(i-1);
-                h.fanout(hard<2>{});
+                h.fanout(hard<3>{});
+                // Removed .fo1() from h because it is fanned out to 3
                 index2[i] = lineaddr ^ select(val<1>{i % 2 == 0}, h, (h << 2) | (h >> (index2_bits - 2)));
             }
         }
+        
+        // 2. IMLI (Inner-most Loop Iteration counter)
+        index2[8] = lineaddr ^ val<index2_bits>{imli_counter};
+        
+        // 3. MODHIST: Using mod_history directly because it is fanned out
+        index2[9] = lineaddr ^ val<index2_bits>{mod_history};
+        
+        // 4. MODPATH: Using mod_path directly because it is fanned out
+        index2[10] = lineaddr ^ val<index2_bits>{mod_path};
+        
+        // 5. GHISTMODPATH: Using mod_history and mod_path directly because they are fanned out
+        index2[11] = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
+        
+        // 6. RECENCY: Using recency_stack directly instead of .fo1() because it is fanned out
+        val<64> recency_hash = recency_stack.fold_xor();
+        index2[12] = lineaddr ^ val<index2_bits>{recency_hash};
+        
+        // 7. RECENCYPOS: Using elements of recency_stack and inst_pc directly without .fo1()
+        val<8> pos0 = RECENCY_DEPTH;
+        val<8> pos1 = select(recency_stack[0] == inst_pc, val<8>{0}, pos0);
+        val<8> pos2 = select(recency_stack[1] == inst_pc, val<8>{1}, pos1);
+        val<8> pos3 = select(recency_stack[2] == inst_pc, val<8>{2}, pos2);
+        val<8> pos4 = select(recency_stack[3] == inst_pc, val<8>{3}, pos3);
+        val<8> pos5 = select(recency_stack[4] == inst_pc, val<8>{4}, pos4);
+        val<8> pos6 = select(recency_stack[5] == inst_pc, val<8>{5}, pos5);
+        val<8> pos7 = select(recency_stack[6] == inst_pc, val<8>{6}, pos6);
+        val<8> pos8 = select(recency_stack[7] == inst_pc, val<8>{7}, pos7);
+        val<8> pos = pos8;
+        index2[13] = lineaddr ^ val<index2_bits>{pos};
+        
+        // 8. BLURRYPATH
+        index2[14] = lineaddr ^ val<index2_bits>{blurry_path_history};
+        
+        // 9. ACYCLIC: Used inst_pc directly without .fo1() and read from single acyclic_table RAM
+        val<1> acyclic_val = acyclic_table.read(val<std::bit_width(ACYCLIC_SIZE-1)>{inst_pc % hard<ACYCLIC_SIZE>{}});
+        index2[15] = lineaddr ^ val<index2_bits>{acyclic_val};
         index2.fanout(hard<2>{});
 
         for (u64 i=0; i<NTABLES; i++) {
@@ -166,6 +241,14 @@ struct mpp : predictor {
     {
         val<1> &mispredict = block_end_info.is_mispredict;
         val<64> &next_pc = block_end_info.next_pc;
+        next_pc.fanout(hard<3>{});
+        // Fanout fanned to LINEINST + 1 to cover both loop branches and block ending updates
+        current_line_pc.fanout(hard<LINEINST+1>{});
+        last_region.fanout(hard<LINEINST+1>{});
+        imli_counter.fanout(hard<LINEINST+1>{});
+        mod_history.fanout(hard<LINEINST+1>{});
+        mod_path.fanout(hard<LINEINST+1>{});
+        blurry_path_history.fanout(hard<LINEINST+1>{});
 
         if (num_branch == 0) {
             val<1> line_end = block_entry >> (LINEINST - block_size);
@@ -182,7 +265,7 @@ struct mpp : predictor {
         }
 
         branch_dir.fanout(hard<2>{});
-        branch_offset.fanout(hard<LINEINST>{});
+        branch_offset.fanout(hard<LINEINST + 1>{});
         index1.fanout(hard<LINEINST*3>{});
         index2.fanout(hard<LINEINST>{});
         yout.fanout(hard<3>{});
@@ -208,7 +291,7 @@ struct mpp : predictor {
         arr<val<1>, LINEINST> branch_taken = [&](u64 offset){
             return (actualdirs & update_mask[offset]) != hard<0>{};
         };
-        branch_taken.fanout(hard<NTABLES+1>{});
+        branch_taken.fanout(hard<NTABLES+2>{});
 
         auto p2_split = p2.make_array(val<1>{});
         p2_split.fanout(hard<3>{});
@@ -250,14 +333,20 @@ struct mpp : predictor {
                 table1_pred[offset].write(index1, p2_split[offset]);
             });
         }
+        val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
+        // Fanout fanned to LINEINST + 1: LINEINST for loop checks, 1 for block-ending update
+        last_offset.fanout(hard<LINEINST+1>{});
+
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(is_branch[offset], [&](){
+                // Statically, each offset branch updates its own offset table1_hyst RAM, which is perfectly parallel
                 table1_hyst[offset].write(index1, ~disagree[offset]);
             });
         }
 
         for (u64 offset=0; offset<LINEINST; offset++) {
-            execute_if(train[offset].fo1(), [&](){
+            // Removed .fo1() because train inherits the fanout credit of train_mask
+            execute_if(train[offset], [&](){
                 for (u64 i=0; i<NTABLES; i++) {
                     wtable[i][offset].write(index2[i], update_ctr(readw[offset][i], ~branch_taken[offset]));
                 }
@@ -273,6 +362,57 @@ struct mpp : predictor {
             next_pc.fanout(hard<2>{});
             global_history1 = (global_history1 << 1) ^ val<GHIST1>{next_pc >> 2};
             gfolds.update(val<PATHBITS>{next_pc >> 2});
+
+            // ---- Novel Speculative History updates are performed ONLY ONCE outside loop at block end ----
+            // branch_pc for the block-ending conditional branch instruction
+            val<64> branch_pc = current_line_pc.fo1() | (val<64>{last_offset} << 2);
+            val<1> taken = branch_dir[num_branch-1];
+            branch_pc.fanout(hard<5>{});
+            taken.fanout(hard<4>{});
+
+            // 1. IMLI counter update: Read from single IMLI rwram
+            val<1> is_forward = is_forward_table.read(val<10>{branch_pc >> 2});
+            is_forward.fanout(hard<2>{});
+            execute_if(taken, [&](){
+                val<1> is_fwd = block_end_info.next_pc > branch_pc;
+                // Passed hard<0> because a read is always performed in the same cycle
+                is_forward_table.write(val<10>{branch_pc >> 2}, is_fwd, hard<0>{});
+            });
+            execute_if(is_forward, [&](){
+                imli_counter = select(taken, val<IMLI_BITS>{0}, val<IMLI_BITS>{imli_counter.fo1() + 1});
+            });
+
+            // 2. MODHIST update
+            val<1> mod_match = (val<std::bit_width(MODULUS-1)>{branch_pc} == 0);
+            mod_match.fanout(hard<2>{});
+            execute_if(mod_match, [&](){
+                mod_history = (mod_history.fo1() << 1) | val<64>{taken};
+            });
+
+            // 3. MODPATH update
+            execute_if(mod_match, [&](){
+                mod_path = (mod_path.fo1() << 1) | val<64>{branch_pc >> 2};
+            });
+
+            // 4. RECENCY stack update (FIFO push)
+            for (u64 i = RECENCY_DEPTH - 1; i > 0; i--) {
+                recency_stack[i] = recency_stack[i-1];
+            }
+            recency_stack[0] = branch_pc;
+
+            // 5. BLURRYPATH update
+            val<64> current_region = branch_pc >> BLURRY_SHIFT;
+            current_region.fanout(hard<2>{});
+            val<64> lr = last_region.fo1();
+            lr.fanout(hard<2>{});
+            execute_if(current_region != lr, [&](){
+                blurry_path_history = (blurry_path_history.fo1() << 1) | val<64>{lr};
+                last_region = current_region;
+            });
+
+            // 6. ACYCLIC update: Write to acyclic_table rwram
+            // Passed hard<0> to safely handle simultaneous read-write cycles across predict2/update_cycle
+            acyclic_table.write(val<std::bit_width(ACYCLIC_SIZE-1)>{branch_pc % hard<ACYCLIC_SIZE>{}}, taken, hard<0>{});
         });
 
         num_branch = 0;
