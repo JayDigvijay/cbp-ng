@@ -9,9 +9,9 @@ using namespace hcm;
 
 template<
     u64 LOGLB    = 6,   // 64B fetch block
-    u64 NTABLES  = 16,  // number of tables (increased for MPP)
+    u64 NTABLES  = 12,  // number of tables (increased for MPP)
     u64 MPP_TABLES = 8, // number of MPP features (excluding base features)
-    u64 MAXHIST  = 100, // maximum global history length
+    u64 MAXHIST  = 150, // maximum global history length
     u64 MINHIST  = 2,   // minimum global history length
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
     u64 LOGTABLE = 13,  // 32KB hashed perceptron for P2
@@ -155,25 +155,26 @@ struct mpp : predictor {
                 auto h = gfolds.template get<0>(i-1);
                 h.fanout(hard<3>{});
                 // Removed .fo1() from h because it is fanned out to 3
-                index2[i] = lineaddr ^ select(val<1>{i % 2 == 0}, h, (h << 2) | (h >> (index2_bits - 2)));
+                //index2[i] = lineaddr ^ select(val<1>{i % 2 == 0}, h, (h << 2) | (h >> (index2_bits - 2)));
+                index2[i] = lineaddr ^ h;
             }
         }
         
         // 2. IMLI (Inner-most Loop Iteration counter)
-        index2[8] = lineaddr ^ val<index2_bits>{imli_counter};
+        index2[NUMHIST] = lineaddr ^ val<index2_bits>{imli_counter};
         
         // 3. MODHIST: Using mod_history directly because it is fanned out
-        index2[9] = lineaddr ^ val<index2_bits>{mod_history};
+        index2[NUMHIST+1] = lineaddr ^ val<index2_bits>{mod_history};
         
         // 4. MODPATH: Using mod_path directly because it is fanned out
-        index2[10] = lineaddr ^ val<index2_bits>{mod_path};
+        index2[NUMHIST+2] = lineaddr ^ val<index2_bits>{mod_path};
         
         // 5. GHISTMODPATH: Using mod_history and mod_path directly because they are fanned out
-        index2[11] = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
+        index2[NUMHIST+3] = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
         
         // 6. RECENCY: Using recency_stack directly instead of .fo1() because it is fanned out
         val<64> recency_hash = recency_stack.fold_xor();
-        index2[12] = lineaddr ^ val<index2_bits>{recency_hash};
+        index2[NUMHIST+4] = lineaddr ^ val<index2_bits>{recency_hash};
         
         // 7. RECENCYPOS: Using elements of recency_stack and inst_pc directly without .fo1()
 
@@ -186,10 +187,10 @@ struct mpp : predictor {
             }
         }
 
-        index2[13] = lineaddr ^ val<index2_bits>{recency_idx[0]};
+        index2[NUMHIST+5] = lineaddr ^ val<index2_bits>{recency_idx[0]};
         
         // 8. BLURRYPATH
-        index2[14] = lineaddr ^ val<index2_bits>{blurry_path_history};
+        index2[NUMHIST+6] = lineaddr ^ val<index2_bits>{blurry_path_history};
         
         // 9. ACYCLIC: Used inst_pc directly without .fo1() and read from array acyclic_path
         // Compute the index as a combinational val
@@ -199,8 +200,8 @@ struct mpp : predictor {
         // Select the element combinationally using the MUX select method
         val<1> acyclic_val = acyclic_path.select(acyclic_idx);
 
-        index2[15] = lineaddr ^ val<index2_bits>{acyclic_val};
-        index2.fanout(hard<2>{});
+        index2[NUMHIST+7] = lineaddr ^ val<index2_bits>{acyclic_val};
+        index2.fanout(hard<2*LINEINST>{});
 
         for (u64 i=0; i<NTABLES; i++) {
             auto dindex2 = index2[i].distribute(wtable[i]);
@@ -388,7 +389,7 @@ struct mpp : predictor {
             val<1> mod_match = ((branch_pc % hard<MODULUS>{}) == 0);
             mod_match.fanout(hard<2>{});
             execute_if(mod_match, [&](){
-                mod_history = (mod_history.fo1() << 1) | val<64>{taken};
+                mod_history = (mod_history.fo1() << 1) | taken;
                 mod_path = (mod_path.fo1() << 1) | val<64>{branch_pc >> 2};
             });
 
