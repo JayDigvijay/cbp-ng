@@ -10,6 +10,7 @@ using namespace hcm;
 template<
     u64 LOGLB    = 6,   // 64B fetch block
     u64 NTABLES  = 16,  // number of tables (increased for MPP)
+    u64 MPP_TABLES = 8, // number of MPP features (excluding base features)
     u64 MAXHIST  = 100, // maximum global history length
     u64 MINHIST  = 2,   // minimum global history length
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
@@ -20,16 +21,17 @@ template<
     // Novel features parameters
     u64 IMLI_BITS = 8,
     u64 MODULUS   = 4,
+    u64 MODHIST_SIZE = 32,
     u64 RECENCY_DEPTH = 8,
     u64 BLURRY_SHIFT = 4,
-    u64 ACYCLIC_SIZE = 16
+    u64 ACYCLIC_SIZE = 8
 >
 struct mpp : predictor {
     static_assert(LOGLB >= 2);
     static constexpr u64 LOGLINEINST = LOGLB - 2; // 4B instruction
 
     static constexpr u64 LINEINST = 1ull << LOGLINEINST;
-    static constexpr u64 NUMHIST = 8; // number of tables using history, same as hashed perceptron
+    static constexpr u64 NUMHIST = NTABLES - MPP_TABLES; // number of tables using history, same as hashed perceptron
 
     static constexpr u64 YBITS  = WBITS + std::bit_width(NTABLES-1);
     static constexpr u64 TCBITS = 4; // corresponds to SPEED = 16
@@ -46,17 +48,16 @@ struct mpp : predictor {
 
     // ---- Novel Features State ----
     reg<IMLI_BITS> imli_counter = 0;
-    // Declared is_forward_table as rwram to support simultaneous read and write in the same cycle
-    rwram<1, 1024, 2> is_forward_table {"imli_forward"};
     
     arr<reg<64>, RECENCY_DEPTH> recency_stack;
+    arr<reg<8>, RECENCY_DEPTH> recency_idx;
     reg<64> last_region = 0;
     
-    reg<64> mod_history = 0;
+    reg<MODHIST_SIZE> mod_history = 0;
     reg<64> mod_path = 0;
     
-    // Declared acyclic_table as rwram to support simultaneous read and write in the same cycle
-    rwram<1, ACYCLIC_SIZE, 2> acyclic_table {"acyclic"};
+    // Declared acyclic_path as array of regs
+    arr<reg<1>, ACYCLIC_SIZE> acyclic_path;
     reg<64> blurry_path_history = 0;
     reg<64> current_line_pc = 0;
 
@@ -175,23 +176,29 @@ struct mpp : predictor {
         index2[12] = lineaddr ^ val<index2_bits>{recency_hash};
         
         // 7. RECENCYPOS: Using elements of recency_stack and inst_pc directly without .fo1()
-        val<8> pos0 = RECENCY_DEPTH;
-        val<8> pos1 = select(recency_stack[0] == inst_pc, val<8>{0}, pos0);
-        val<8> pos2 = select(recency_stack[1] == inst_pc, val<8>{1}, pos1);
-        val<8> pos3 = select(recency_stack[2] == inst_pc, val<8>{2}, pos2);
-        val<8> pos4 = select(recency_stack[3] == inst_pc, val<8>{3}, pos3);
-        val<8> pos5 = select(recency_stack[4] == inst_pc, val<8>{4}, pos4);
-        val<8> pos6 = select(recency_stack[5] == inst_pc, val<8>{5}, pos5);
-        val<8> pos7 = select(recency_stack[6] == inst_pc, val<8>{6}, pos6);
-        val<8> pos8 = select(recency_stack[7] == inst_pc, val<8>{7}, pos7);
-        val<8> pos = pos8;
-        index2[13] = lineaddr ^ val<index2_bits>{pos};
+
+        for (i64 i = RECENCY_DEPTH; i > 0; i--) {
+            if (i == RECENCY_DEPTH) {
+                recency_idx[i-1] = i;
+            }
+            else {
+                recency_idx[i-1] = select(recency_stack[i] == inst_pc, val<8>{i}, recency_idx[i]);
+            }
+        }
+
+        index2[13] = lineaddr ^ val<index2_bits>{recency_idx[0]};
         
         // 8. BLURRYPATH
         index2[14] = lineaddr ^ val<index2_bits>{blurry_path_history};
         
-        // 9. ACYCLIC: Used inst_pc directly without .fo1() and read from single acyclic_table RAM
-        val<1> acyclic_val = acyclic_table.read(val<std::bit_width(ACYCLIC_SIZE-1)>{inst_pc % hard<ACYCLIC_SIZE>{}});
+        // 9. ACYCLIC: Used inst_pc directly without .fo1() and read from array acyclic_path
+        // Compute the index as a combinational val
+        val<std::bit_width(ACYCLIC_SIZE-1)> acyclic_idx = val<std::bit_width(ACYCLIC_SIZE-1)>{inst_pc % hard<ACYCLIC_SIZE>{}};
+        // Statically fan out the array to read it combinationally
+        acyclic_path.fanout(hard<2>{});
+        // Select the element combinationally using the MUX select method
+        val<1> acyclic_val = acyclic_path.select(acyclic_idx);
+
         index2[15] = lineaddr ^ val<index2_bits>{acyclic_val};
         index2.fanout(hard<2>{});
 
@@ -370,29 +377,21 @@ struct mpp : predictor {
             branch_pc.fanout(hard<5>{});
             taken.fanout(hard<4>{});
 
-            // 1. IMLI counter update: Read from single IMLI rwram
-            val<1> is_forward = is_forward_table.read(val<10>{branch_pc >> 2});
-            is_forward.fanout(hard<2>{});
-            execute_if(taken, [&](){
-                val<1> is_fwd = block_end_info.next_pc > branch_pc;
-                // Passed hard<0> because a read is always performed in the same cycle
-                is_forward_table.write(val<10>{branch_pc >> 2}, is_fwd, hard<0>{});
-            });
-            execute_if(is_forward, [&](){
+            // 1. IMLI Loop Update (using array of regs lookup and write)
+            val<1> is_forward = next_pc > branch_pc;
+
+            execute_if(is_forward.fo1(), [&](){
                 imli_counter = select(taken, val<IMLI_BITS>{0}, val<IMLI_BITS>{imli_counter.fo1() + 1});
             });
 
-            // 2. MODHIST update
-            val<1> mod_match = (val<std::bit_width(MODULUS-1)>{branch_pc} == 0);
+            // 2.& 3. MODHIST and MODPATH update
+            val<1> mod_match = ((branch_pc % hard<MODULUS>{}) == 0);
             mod_match.fanout(hard<2>{});
             execute_if(mod_match, [&](){
                 mod_history = (mod_history.fo1() << 1) | val<64>{taken};
-            });
-
-            // 3. MODPATH update
-            execute_if(mod_match, [&](){
                 mod_path = (mod_path.fo1() << 1) | val<64>{branch_pc >> 2};
             });
+
 
             // 4. RECENCY stack update (FIFO push)
             for (u64 i = RECENCY_DEPTH - 1; i > 0; i--) {
@@ -410,9 +409,14 @@ struct mpp : predictor {
                 last_region = current_region;
             });
 
-            // 6. ACYCLIC update: Write to acyclic_table rwram
-            // Passed hard<0> to safely handle simultaneous read-write cycles across predict2/update_cycle
-            acyclic_table.write(val<std::bit_width(ACYCLIC_SIZE-1)>{branch_pc % hard<ACYCLIC_SIZE>{}}, taken, hard<0>{});
+            // 6. ACYCLIC update: Write to acyclic_path array
+            val<std::bit_width(ACYCLIC_SIZE-1)> update_acyclic_idx = val<std::bit_width(ACYCLIC_SIZE-1)>{branch_pc % hard<ACYCLIC_SIZE>{}};
+            update_acyclic_idx.fanout(hard<ACYCLIC_SIZE>{});
+            for (u64 i = 0; i < ACYCLIC_SIZE; i++) {
+                execute_if(update_acyclic_idx == i, [&]() {
+                    acyclic_path[i] = taken;
+                });
+            }
         });
 
         num_branch = 0;
