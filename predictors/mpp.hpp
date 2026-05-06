@@ -9,14 +9,14 @@ using namespace hcm;
 
 template<
     u64 LOGLB    = 6,   // 64B fetch block
-    u64 NTABLES  = 10,  // number of tables (increased for MPP)
-    u64 MPP_TABLES = 6, // number of MPP features (excluding base features)
-    u64 MAXHIST  = 150, // maximum global history length
+    u64 NTABLES  = 11,  // number of tables (increased for MPP)
+    u64 MPP_TABLES = 7, // number of MPP features (excluding base features)
+    u64 MAXHIST  = 50, // maximum global history length
     u64 MINHIST  = 2,   // minimum global history length
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
     u64 LOGTABLE = 13,  // 32KB hashed perceptron for P2
-    u64 LOGP1    = 14,  // 4KB gshare for P1
-    u64 GHIST1   = 6,   // P1 gshare history length
+    u64 LOGP1    = 15,  // 4KB gshare for P1
+    u64 GHIST1   = 11,   // P1 gshare history length
     
     // Novel features parameters
     u64 IMLI_BITS = 8,
@@ -178,6 +178,15 @@ struct mpp : predictor {
         val<1> acyclic_val = acyclic_path.select(acyclic_idx);
 
         index2[NUMHIST+5] = lineaddr ^ val<index2_bits>{acyclic_val};
+
+        // 8. GLOBAL HISTORY: Reuse gShare history
+        global_history1.fanout(hard<2>{});
+        if constexpr (GHIST1 <= index2_bits) {
+            index2[NUMHIST+6] = lineaddr.fo1() ^ (val<index2_bits>{global_history1} << (index2_bits - GHIST1));
+        } else {
+            index2[NUMHIST+6] = global_history1.make_array(val<index2_bits>{}).append(lineaddr.fo1()).fold_xor();
+        }
+
         index2.fanout(hard<2*LINEINST>{});
 
         for (u64 i=0; i<NTABLES; i++) {
