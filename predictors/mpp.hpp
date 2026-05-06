@@ -9,8 +9,8 @@ using namespace hcm;
 
 template<
     u64 LOGLB    = 6,   // 64B fetch block
-    u64 NTABLES  = 12,  // number of tables (increased for MPP)
-    u64 MPP_TABLES = 8, // number of MPP features (excluding base features)
+    u64 NTABLES  = 10,  // number of tables (increased for MPP)
+    u64 MPP_TABLES = 6, // number of MPP features (excluding base features)
     u64 MAXHIST  = 150, // maximum global history length
     u64 MINHIST  = 2,   // minimum global history length
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
@@ -22,7 +22,7 @@ template<
     u64 IMLI_BITS = 8,
     u64 MODULUS   = 4,
     u64 MODHIST_SIZE = 32,
-    u64 RECENCY_DEPTH = 8,
+    u64 RECENCY_DEPTH = 1,
     u64 BLURRY_SHIFT = 4,
     u64 ACYCLIC_SIZE = 8
 >
@@ -49,8 +49,8 @@ struct mpp : predictor {
     // ---- Novel Features State ----
     reg<IMLI_BITS> imli_counter = 0;
     
-    arr<reg<64>, RECENCY_DEPTH> recency_stack;
-    arr<reg<8>, RECENCY_DEPTH> recency_idx;
+    //arr<reg<64>, RECENCY_DEPTH> recency_stack;
+    //arr<reg<8>, RECENCY_DEPTH> recency_idx;
     reg<64> last_region = 0;
     
     reg<MODHIST_SIZE> mod_history = 0;
@@ -132,15 +132,9 @@ struct mpp : predictor {
     }
 
     val<1> predict2(val<64> inst_pc)
-    {
-        // Fanout pc for loop iter counters, recency stack, index, and acyclic features
-        inst_pc.fanout(hard<RECENCY_DEPTH + 2>{});
-        for (u64 i=0; i<RECENCY_DEPTH; i++) {
-            // Each element in the recency stack is fanned out for comparisons and hashing
-            recency_stack[i].fanout(hard<2>{});
-        }
-        
+    {   
         // Used inst_pc directly instead of .fo1() because it is already fanned out
+        inst_pc.fanout(hard<2>{});
         val<index2_bits> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<NTABLES>{});
         mod_history.fanout(hard<2>{});
@@ -172,27 +166,10 @@ struct mpp : predictor {
         // 5. GHISTMODPATH: Using mod_history and mod_path directly because they are fanned out
         index2[NUMHIST+3] = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
         
-        // 6. RECENCY: Using recency_stack directly instead of .fo1() because it is fanned out
-        val<64> recency_hash = recency_stack.fold_xor();
-        index2[NUMHIST+4] = lineaddr ^ val<index2_bits>{recency_hash};
+        // 6. BLURRYPATH
+        index2[NUMHIST+4] = lineaddr ^ val<index2_bits>{blurry_path_history};
         
-        // 7. RECENCYPOS: Using elements of recency_stack and inst_pc directly without .fo1()
-
-        for (i64 i = RECENCY_DEPTH; i > 0; i--) {
-            if (i == RECENCY_DEPTH) {
-                recency_idx[i-1] = i;
-            }
-            else {
-                recency_idx[i-1] = select(recency_stack[i] == inst_pc, val<8>{i}, recency_idx[i]);
-            }
-        }
-
-        index2[NUMHIST+5] = lineaddr ^ val<index2_bits>{recency_idx[0]};
-        
-        // 8. BLURRYPATH
-        index2[NUMHIST+6] = lineaddr ^ val<index2_bits>{blurry_path_history};
-        
-        // 9. ACYCLIC: Used inst_pc directly without .fo1() and read from array acyclic_path
+        // 7. ACYCLIC: Used inst_pc directly without .fo1() and read from array acyclic_path
         // Compute the index as a combinational val
         val<std::bit_width(ACYCLIC_SIZE-1)> acyclic_idx = val<std::bit_width(ACYCLIC_SIZE-1)>{inst_pc % hard<ACYCLIC_SIZE>{}};
         // Statically fan out the array to read it combinationally
@@ -200,7 +177,7 @@ struct mpp : predictor {
         // Select the element combinationally using the MUX select method
         val<1> acyclic_val = acyclic_path.select(acyclic_idx);
 
-        index2[NUMHIST+7] = lineaddr ^ val<index2_bits>{acyclic_val};
+        index2[NUMHIST+5] = lineaddr ^ val<index2_bits>{acyclic_val};
         index2.fanout(hard<2*LINEINST>{});
 
         for (u64 i=0; i<NTABLES; i++) {
@@ -393,12 +370,6 @@ struct mpp : predictor {
                 mod_path = (mod_path.fo1() << 1) | val<64>{branch_pc >> 2};
             });
 
-
-            // 4. RECENCY stack update (FIFO push)
-            for (u64 i = RECENCY_DEPTH - 1; i > 0; i--) {
-                recency_stack[i] = recency_stack[i-1];
-            }
-            recency_stack[0] = branch_pc;
 
             // 5. BLURRYPATH update
             val<64> current_region = branch_pc >> BLURRY_SHIFT;
