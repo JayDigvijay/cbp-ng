@@ -25,7 +25,8 @@ template<
     u64 MODHIST_SIZE = 32,
     u64 RECENCY_DEPTH = 1,
     u64 TGT_IMLI_SHIFT = 4,
-    u64 ACYCLIC_SIZE = 16
+    u64 ACYCLIC_SIZE = 16,
+    u64 GSHARE_PRED_BANKS = 1
 >
 struct mpp : predictor {
     static_assert(LOGLB >= 2);
@@ -88,7 +89,7 @@ struct mpp : predictor {
     // ---- RAMs ----
     ram<val<WBITS, i64>, (1 << index2_bits)> wtable[NTABLES][LINEINST] {{"P2 weight"}};
 
-    rwram<1, (1 << index1_bits), 2> table1_pred[LINEINST] {"P1 pred"};
+    rwram<GSHARE_PRED_BANKS, (1 << index1_bits), 2> table1_pred[LINEINST] {"P1 pred"};
     zone UPDATE_ONLY;
     ram<val<1>, (1 << index1_bits)> table1_hyst[LINEINST] {"P1 hyst"};
 
