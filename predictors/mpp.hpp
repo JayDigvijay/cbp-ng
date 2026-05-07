@@ -9,8 +9,8 @@ using namespace hcm;
 
 template<
     u64 LOGLB    = 6,   // 64B fetch block
-    u64 NTABLES  = 11,  // number of tables (increased for MPP)
-    u64 MPP_TABLES = 7, // number of MPP features (excluding base features)
+    u64 NTABLES  = 10,  // number of tables (increased for MPP)
+    u64 MPP_TABLES = 5, // number of MPP features (excluding base features)
     u64 MAXHIST  = 50, // maximum global history length
     u64 MINHIST  = 2,   // minimum global history length
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
@@ -24,7 +24,7 @@ template<
     u64 MODHIST_SIZE = 32,
     u64 RECENCY_DEPTH = 1,
     u64 BLURRY_SHIFT = 4,
-    u64 ACYCLIC_SIZE = 8
+    u64 ACYCLIC_SIZE = 16
 >
 struct mpp : predictor {
     static_assert(LOGLB >= 2);
@@ -142,32 +142,29 @@ struct mpp : predictor {
         gfolds.fanout(hard<2>{});
         
         // 1. Bimodal / Global History (Original Hashed Perceptron style for first 8 tables)
-        for (u64 i=0; i<NUMHIST; i++) {
+        arr<val<index2_bits>, NUMHIST> hashed_hist_indices = {[&](u64 i) {
             if (i == 0) {
-                index2[i] = lineaddr;
+                return lineaddr.fo1();
             } else {
                 auto h = gfolds.template get<0>(i-1);
-                h.fanout(hard<3>{});
-                // Removed .fo1() from h because it is fanned out to 3
-                //index2[i] = lineaddr ^ select(val<1>{i % 2 == 0}, h, (h << 2) | (h >> (index2_bits - 2)));
-                index2[i] = lineaddr ^ h;
+                return lineaddr.fo1() ^ h;
             }
-        }
+        }};
         
         // 2. IMLI (Inner-most Loop Iteration counter)
-        index2[NUMHIST] = lineaddr ^ val<index2_bits>{imli_counter};
+        val<index2_bits> imli_index = lineaddr ^ val<index2_bits>{imli_counter};
         
         // 3. MODHIST: Using mod_history directly because it is fanned out
-        index2[NUMHIST+1] = lineaddr ^ val<index2_bits>{mod_history};
+        val<index2_bits> modhist_index = lineaddr ^ val<index2_bits>{mod_history};
         
         // 4. MODPATH: Using mod_path directly because it is fanned out
-        index2[NUMHIST+2] = lineaddr ^ val<index2_bits>{mod_path};
+        val<index2_bits> modpath_index = lineaddr ^ val<index2_bits>{mod_path};
         
         // 5. GHISTMODPATH: Using mod_history and mod_path directly because they are fanned out
-        index2[NUMHIST+3] = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
+        val<index2_bits> ghistmodpath_index = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
         
         // 6. BLURRYPATH
-        index2[NUMHIST+4] = lineaddr ^ val<index2_bits>{blurry_path_history};
+       // val<index2_bits> blurrypath_index = lineaddr ^ val<index2_bits>{blurry_path_history};
         
         // 7. ACYCLIC: Used inst_pc directly without .fo1() and read from array acyclic_path
         // Compute the index as a combinational val
@@ -177,17 +174,30 @@ struct mpp : predictor {
         // Select the element combinationally using the MUX select method
         val<1> acyclic_val = acyclic_path.select(acyclic_idx);
 
-        index2[NUMHIST+5] = lineaddr ^ val<index2_bits>{acyclic_val};
+        val<index2_bits> acyclic_index = lineaddr ^ val<index2_bits>{acyclic_val};
 
         // 8. GLOBAL HISTORY: Reuse gShare history
+        /*
         global_history1.fanout(hard<2>{});
-        if constexpr (GHIST1 <= index2_bits) {
-            index2[NUMHIST+6] = lineaddr.fo1() ^ (val<index2_bits>{global_history1} << (index2_bits - GHIST1));
-        } else {
-            index2[NUMHIST+6] = global_history1.make_array(val<index2_bits>{}).append(lineaddr.fo1()).fold_xor();
-        }
+        val<index2_bits> global_history_index = [&](){
+            if constexpr (GHIST1 <= index2_bits) {
+                return lineaddr.fo1() ^ (val<index2_bits>{global_history1} << (index2_bits - GHIST1));
+            } else {
+                return global_history1.make_array(val<index2_bits>{}).append(lineaddr.fo1()).fold_xor();
+            }
+        }();
+        */
 
-        index2.fanout(hard<2*LINEINST>{});
+        auto index2_vals = hashed_hist_indices
+                            .append(imli_index)
+                            .append(modhist_index)
+                            .append(modpath_index)
+                            .append(ghistmodpath_index)
+                            //.append(blurrypath_index)
+                            .append(acyclic_index)
+                            //.append(global_history_index);
+        index2 = index2_vals;
+        index2.fanout(hard<2 * LINEINST>{});
 
         for (u64 i=0; i<NTABLES; i++) {
             auto dindex2 = index2[i].distribute(wtable[i]);
