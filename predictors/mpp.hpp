@@ -94,12 +94,10 @@ struct mpp : predictor {
 
     void new_block(val<64> inst_pc)
     {
-        // Removed .fo1() because inst_pc was fanned out inside predict1
         val<LOGLINEINST> offset = inst_pc >> 2;
         block_entry = offset.fo1().decode().concat();
         block_entry.fanout(hard<4*LINEINST>{});
         block_size = 1;
-        // inst_pc is fanned out and can be read a second time here without .fo1()
         current_line_pc = (inst_pc >> LOGLB) << LOGLB;
     }
 
@@ -136,7 +134,6 @@ struct mpp : predictor {
 
     val<1> predict2(val<64> inst_pc)
     {   
-        // Used inst_pc directly instead of .fo1() because it is already fanned out
         inst_pc.fanout(hard<2>{});
         val<index2_bits> lineaddr = inst_pc >> LOGLB;
         lineaddr.fanout(hard<NTABLES>{});
@@ -147,10 +144,10 @@ struct mpp : predictor {
         // 1. Bimodal / Global History (Original Hashed Perceptron style for first 8 tables)
         arr<val<index2_bits>, NUMHIST> hashed_hist_indices = {[&](u64 i) {
             if (i == 0) {
-                return lineaddr.fo1();
+                return lineaddr;
             } else {
                 auto h = gfolds.template get<0>(i-1);
-                return lineaddr.fo1() ^ h;
+                return lineaddr ^ h;
             }
         }};
         
@@ -173,7 +170,7 @@ struct mpp : predictor {
         val<index2_bits> ghistmodpath_index = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
         
         
-        // 7. ACYCLIC: Used inst_pc directly without .fo1() and read from array acyclic_path
+        // 7. ACYCLIC: Used inst_pc directly and read from array acyclic_path
         // Compute the index as a combinational val
         val<std::bit_width(ACYCLIC_SIZE-1)> acyclic_idx = val<std::bit_width(ACYCLIC_SIZE-1)>{inst_pc % hard<ACYCLIC_SIZE>{}};
         // Statically fan out the array to read it combinationally
@@ -188,9 +185,9 @@ struct mpp : predictor {
         global_history1.fanout(hard<2>{});
         val<index2_bits> global_history_index = [&](){
             if constexpr (GHIST1 <= index2_bits) {
-                return lineaddr.fo1() ^ (val<index2_bits>{global_history1} << (index2_bits - GHIST1));
+                return lineaddr ^ (val<index2_bits>{global_history1} << (index2_bits - GHIST1));
             } else {
-                return global_history1.make_array(val<index2_bits>{}).append(lineaddr.fo1()).fold_xor();
+                return global_history1.make_array(val<index2_bits>{}).append(lineaddr).fold_xor();
             }
         }();
         */
@@ -386,12 +383,12 @@ struct mpp : predictor {
             // 1. IMLI Loop Update (using array of regs lookup and write)
             val<1> is_forward = next_pc > branch_pc;
 
-            execute_if(is_forward.fo1(), [&](){
+            execute_if(is_forward, [&](){
                 // Forward IMLI counter is incremented for not-taken forward branches, reset for taken forward branches
                 imli_counter = select(taken, val<IMLI_BITS>{0}, val<IMLI_BITS>{imli_counter.fo1() + 1});
             });
 
-            execute_if(~is_forward.fo1(), [&](){
+            execute_if(~is_forward, [&](){
                 // Backward IMLI counter is incremented for taken backward branches, reset for not-taken backward branches
                 back_imli_counter = select(taken, val<IMLI_BITS>{back_imli_counter.fo1() + 1}, val<IMLI_BITS>{0});
             });
