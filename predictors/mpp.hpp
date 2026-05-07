@@ -88,7 +88,7 @@ struct mpp : predictor {
     // ---- RAMs ----
     ram<val<WBITS, i64>, (1 << index2_bits)> wtable[NTABLES][LINEINST] {{"P2 weight"}};
 
-    ram<val<1>, (1 << index1_bits)> table1_pred[LINEINST] {"P1 pred"};
+    rwram<1, (1 << index1_bits), 2> table1_pred[LINEINST] {"P1 pred"};
     zone UPDATE_ONLY;
     ram<val<1>, (1 << index1_bits)> table1_hyst[LINEINST] {"P1 hyst"};
 
@@ -340,7 +340,7 @@ struct mpp : predictor {
 
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(p1_weak[offset].fo1(), [&](){
-                table1_pred[offset].write(index1, p2_split[offset]);
+                table1_pred[offset].write(index1, p2_split[offset], hard<0>{});
             });
         }
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
