@@ -202,7 +202,7 @@ struct mpp : predictor {
         p2 = p2bits.fo1().concat();
         p2.fanout(hard<LINEINST>{});
 
-        val<1> taken = (block_entry & (p1 | p2)) != hard<0>{};
+        val<1> taken = (block_entry & p2) != hard<0>{};
 
         reuse_prediction(~val<1>{block_entry >> (LINEINST - 1)});
         return taken.fo1();
@@ -210,7 +210,7 @@ struct mpp : predictor {
 
     val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc)
     {
-        val<1> taken = ((block_entry << block_size) & (p1 | p2)) != hard<0>{};
+        val<1> taken = ((block_entry << block_size) & (p2)) != hard<0>{};
 
         reuse_prediction(~val<1>{block_entry >> (LINEINST - 1 - block_size)});
         block_size++;
