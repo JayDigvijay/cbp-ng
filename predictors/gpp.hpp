@@ -7,7 +7,7 @@
 using namespace hcm;
 
 /**
- * @brief GPP (General Perceptron Predictor) / Annotated MPP Predictor
+ * @brief GPP (Gainful Perceptron Predictor)
  * 
  * GPP is a highly optimized multi-feature branch predictor modeled as hardware logic 
  * using the HARCOM framework. It combines a fast, small gshare predictor (P1) with a 
@@ -19,22 +19,20 @@ using namespace hcm;
  */
 template<
     u64 LOGLB    = 6,   // 64B fetch block size (log2). Represents the size of instruction cache lines.
-    u64 NTABLES  = 10,  // Number of perceptron weight tables in P2 (increased for multi-feature MPP).
-    u64 MPP_TABLES = 5, // Number of novel MPP/GPP features (excluding base geometric history features).
-    u64 MAXHIST  = 40, // Maximum global history length used in geometric history folding.
-    u64 MINHIST  = 2,   // Minimum global history length used in geometric history folding.
+    u64 NTABLES  = 8,  // Number of perceptron weight tables in P2 (increased for multi-feature MPP).
+    u64 MPP_TABLES = 3, // Number of novel MPP/GPP features (excluding base geometric history features).
+    u64 MAXHIST  = 55, // Maximum global history length used in geometric history folding.
+    u64 MINHIST  = 5,   // Minimum global history length used in geometric history folding.
     u64 WBITS    = 4,   // Signed 4-bit weight (-8 to 7) stored in the perceptron tables.
-    u64 LOGTABLE = 12,  // Size (log2) of hashed perceptron weight tables (4096 entries per table per inst).
+    u64 LOGTABLE = 13,  // Size (log2) of hashed perceptron weight tables (8192 entries per table).
     u64 LOGP1    = 15,  // Size (log2) of the gshare predictor table for P1 (32KB overall).
-    u64 GHIST1   = 11,   // History length used for the fast P1 gshare predictor.
+    u64 GHIST1   = 10,   // History length used for the fast P1 gshare predictor.
     
     // Novel GPP/MPP Feature Parameters
-    u64 IMLI_BITS = 5,       // Bits for the Inner-most Loop Iteration (IMLI) counter.
+    u64 IMLI_BITS = 4,       // Bits for the Inner-most Loop Iteration (IMLI) counter.
     u64 MODULUS   = 4,       // Modulo parameter for the modulo path/history tracking.
     u64 MODHIST_SIZE = 32,   // History size for the modulo history register.
-    u64 RECENCY_DEPTH = 1,   // Depth of the recency stack tracking recent targets.
-    u64 ACYCLIC_SIZE = 16,   // Size of the acyclic path history register.
-    u64 GSHARE_PRED_BANKS = 1
+    u64 ACYCLIC_SIZE = 16   // Size of the acyclic path history register.
 >
 struct gpp : predictor {
     static_assert(LOGLB >= 2);
@@ -73,9 +71,6 @@ struct gpp : predictor {
     // Inner-most Loop Iteration (IMLI) backward loop counter: tracks the iterations of backward branches.
     reg<IMLI_BITS> back_imli_counter = 0;
     
-    // Tracks the region of the last branch target (used for indirect branch feature tracking).
-    reg<64> last_target_region = 0;
-    
     // Modulo History: tracks branch outcomes only for branches whose PCs match a specific modulo condition.
     reg<MODHIST_SIZE> mod_history = 0;
     
@@ -84,9 +79,6 @@ struct gpp : predictor {
     
     // Acyclic Path: records outcomes of branches mapping to a cyclic buffer of size ACYCLIC_SIZE.
     arr<reg<1>, ACYCLIC_SIZE> acyclic_path;
-    
-    // Blurry Path History: stores a coarse-grain history representation.
-    reg<64> blurry_path_history = 0;
     
     // Current Line PC: base address of the current fetch block.
     reg<64> current_line_pc = 0;
@@ -234,19 +226,11 @@ struct gpp : predictor {
         // Combines line address with backward branch iteration counts.
         val<index2_bits> back_imli_index = lineaddr ^ val<index2_bits>{back_imli_counter};
         
-        // --- Feature 3: Modulo History Feature (Table 7) ---
-        // Combines line address with outcomes of modulo-selected branches.
-        val<index2_bits> modhist_index = lineaddr ^ val<index2_bits>{mod_history};
-        
-        // --- Feature 4: Modulo Path Feature (Table 8) ---
-        // Combines line address with modulo-selected branch path addresses.
-        val<index2_bits> modpath_index = lineaddr ^ val<index2_bits>{mod_path};
-        
-        // --- Feature 5: Modulo History + Path Combined Feature (Table 9) ---
+        // --- Feature 3: Modulo History + Path Combined Feature (Table 7) ---
         // Combines both modulo tracking features for multi-dimensional path correlation.
         val<index2_bits> ghistmodpath_index = lineaddr ^ val<index2_bits>{mod_history ^ mod_path};
         
-        // --- Feature 6: Acyclic Path Feature (Table 10) ---
+        // --- Feature 4: Acyclic Path Feature (Table 8) ---
         // Combinationally selects acyclic path bit matching the branch PC index.
         val<std::bit_width(ACYCLIC_SIZE-1)> acyclic_idx = val<std::bit_width(ACYCLIC_SIZE-1)>{inst_pc % hard<ACYCLIC_SIZE>{}};
         acyclic_path.fanout(hard<2>{});
@@ -256,8 +240,6 @@ struct gpp : predictor {
         // Append all computed indices together to represent index2 for all NTABLES
         auto index2_vals = hashed_hist_indices
                             .append(back_imli_index)
-                            .append(modhist_index)
-                            .append(modpath_index)
                             .append(ghistmodpath_index)
                             .append(acyclic_index);
         index2 = index2_vals;
@@ -344,11 +326,9 @@ struct gpp : predictor {
         
         // Static fanouts for end-of-block state update logic
         current_line_pc.fanout(hard<LINEINST+1>{});
-        last_target_region.fanout(hard<LINEINST+1>{});
         back_imli_counter.fanout(hard<LINEINST+1>{});
         mod_history.fanout(hard<LINEINST+1>{});
         mod_path.fanout(hard<LINEINST+1>{});
-        blurry_path_history.fanout(hard<LINEINST+1>{});
 
         // --- Case 1: No conditional branches in this fetch block ---
         if (num_branch == 0) {
@@ -428,7 +408,7 @@ struct gpp : predictor {
         train_mask.fanout(hard<2>{});
         arr<val<1>,LINEINST> train = train_mask.make_array(val<1>{});
 
-        // Selection tracker: track if P1 and P2 disagreed on strong correct predictions
+        // Check if P1 disagrees with a strong P2 prediction
         val<LINEINST> disagree_mask = (p1 ^ p2) & branch_mask & ~weak_mask;
         disagree_mask.fanout(hard<2>{});
         arr<val<1>,LINEINST> disagree = disagree_mask.make_array(val<1>{});
@@ -454,7 +434,7 @@ struct gpp : predictor {
         val<LOGLINEINST> last_offset = branch_offset[num_branch-1];
         last_offset.fanout(hard<LINEINST+1>{});
 
-        // Parallel update to gshare (P1) hysteresis tables based on disagreement masks
+        // Parallel update to gshare (P1) hysteresis tables
         for (u64 offset=0; offset<LINEINST; offset++) {
             execute_if(is_branch[offset], [&](){
                 table1_hyst[offset].write(index1, ~disagree[offset]);
@@ -496,7 +476,7 @@ struct gpp : predictor {
             });
 
             // 2. & 3. Modulo History and Path Updates:
-            // Log outcome of branch PC matching the MODULUS condition to avoid pollution in sparse loops
+            // Log outcome of branch and its PC
             val<1> mod_match = ((branch_pc % hard<MODULUS>{}) == 0);
             mod_match.fanout(hard<2>{});
             execute_if(mod_match, [&](){

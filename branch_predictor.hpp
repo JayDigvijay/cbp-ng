@@ -4,7 +4,6 @@
 #include "predictors/never_taken.hpp"
 #include "predictors/perceptron.hpp"
 #include "predictors/tage.hpp"
-#include "predictors/gbp.hpp"
 #include "predictors/bimodalN.hpp"
 #include "predictors/gshareN.hpp"
 #include "predictors/gshareN_ahead.hpp"
@@ -20,5 +19,5 @@ using branch_predictor = PREDICTOR;
 #else
 //using branch_predictor = bimodal<>;
 //using branch_predictor = gshare<>;
-using branch_predictor = gbp<>;
+using branch_predictor = gpp<>;
 #endif
