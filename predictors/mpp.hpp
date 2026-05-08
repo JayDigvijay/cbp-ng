@@ -9,22 +9,21 @@ using namespace hcm;
 
 template<
     u64 LOGLB    = 6,   // 64B fetch block
-    u64 NTABLES  = 15,  // number of tables (increased for MPP)
+    u64 NTABLES  = 10,  // number of tables (increased for MPP)
     // Ideally 5 hist tables => NTABLES = MPP_TABLES + 5 = 10
-    u64 MPP_TABLES = 7, // number of MPP features (excluding base features)
-    u64 MAXHIST  = 100, // maximum global history length, ideally 50
+    u64 MPP_TABLES = 5, // number of MPP features (excluding base features)
+    u64 MAXHIST  = 40, // maximum global history length, ideally 50
     u64 MINHIST  = 2,   // minimum global history length
     u64 WBITS    = 4,   // signed 4-bit weight (-8 to 7)
-    u64 LOGTABLE = 13,  // 32KB hashed perceptron for P2
+    u64 LOGTABLE = 12,  // 32KB hashed perceptron for P2
     u64 LOGP1    = 15,  // 4KB gshare for P1
     u64 GHIST1   = 11,   // P1 gshare history length
     
     // Novel features parameters
-    u64 IMLI_BITS = 8,
+    u64 IMLI_BITS = 5,
     u64 MODULUS   = 4,
     u64 MODHIST_SIZE = 32,
     u64 RECENCY_DEPTH = 1,
-    u64 TGT_IMLI_SHIFT = 4,
     u64 ACYCLIC_SIZE = 16,
     u64 GSHARE_PRED_BANKS = 1
 >
@@ -49,9 +48,7 @@ struct mpp : predictor {
     reg<1> true_block = 1;
 
     // ---- Novel Features State ----
-    reg<IMLI_BITS> imli_counter = 0;
     reg<IMLI_BITS> back_imli_counter = 0;
-    reg<IMLI_BITS> ta_imli_counter = 0;
     
     //arr<reg<64>, RECENCY_DEPTH> recency_stack;
     //arr<reg<8>, RECENCY_DEPTH> recency_idx;
@@ -95,6 +92,7 @@ struct mpp : predictor {
 
     void new_block(val<64> inst_pc)
     {
+        inst_pc.fanout(hard<2>{});
         val<LOGLINEINST> offset = inst_pc >> 2;
         block_entry = offset.fo1().decode().concat();
         block_entry.fanout(hard<4*LINEINST>{});
@@ -105,7 +103,7 @@ struct mpp : predictor {
     val<1> predict1(val<64> inst_pc)
     {
         // Fanout is fanned to 3: 2 for new_block and 1 for predict1 lineaddr
-        inst_pc.fanout(hard<3>{});
+        inst_pc.fanout(hard<2>{});
         new_block(inst_pc);
 
         // Using inst_pc directly because it is fanned out
@@ -137,7 +135,7 @@ struct mpp : predictor {
     {   
         inst_pc.fanout(hard<2>{});
         val<index2_bits> lineaddr = inst_pc >> LOGLB;
-        lineaddr.fanout(hard<NTABLES>{});
+        lineaddr.fanout(hard<NTABLES + 5>{});
         mod_history.fanout(hard<2>{});
         mod_path.fanout(hard<2>{});
         gfolds.fanout(hard<2>{});
@@ -153,13 +151,8 @@ struct mpp : predictor {
         }};
         
         // 2. IMLI (Inner-most Loop Iteration counter)
-        val<index2_bits> imli_index = lineaddr ^ val<index2_bits>{imli_counter};
-
         // Back IMLI 
         val<index2_bits> back_imli_index = lineaddr ^ val<index2_bits>{back_imli_counter};
-
-        // TA IMLI 
-        val<index2_bits> ta_imli_index = lineaddr ^ val<index2_bits>{ta_imli_counter};
         
         // 3. MODHIST: Using mod_history directly because it is fanned out
         val<index2_bits> modhist_index = lineaddr ^ val<index2_bits>{mod_history};
@@ -181,28 +174,12 @@ struct mpp : predictor {
 
         val<index2_bits> acyclic_index = lineaddr ^ val<index2_bits>{acyclic_val};
 
-        // 8. GLOBAL HISTORY: Reuse gShare history
-        /*
-        global_history1.fanout(hard<2>{});
-        val<index2_bits> global_history_index = [&](){
-            if constexpr (GHIST1 <= index2_bits) {
-                return lineaddr ^ (val<index2_bits>{global_history1} << (index2_bits - GHIST1));
-            } else {
-                return global_history1.make_array(val<index2_bits>{}).append(lineaddr).fold_xor();
-            }
-        }();
-        */
-
         auto index2_vals = hashed_hist_indices
-                            .append(imli_index)
                             .append(back_imli_index)
-                            .append(ta_imli_index)
                             .append(modhist_index)
                             .append(modpath_index)
                             .append(ghistmodpath_index)
-                            //.append(blurrypath_index)
                             .append(acyclic_index);
-                            //.append(global_history_index);
         index2 = index2_vals;
         index2.fanout(hard<2 * LINEINST>{});
 
@@ -225,7 +202,7 @@ struct mpp : predictor {
         p2 = p2bits.fo1().concat();
         p2.fanout(hard<LINEINST>{});
 
-        val<1> taken = (block_entry & p2) != hard<0>{};
+        val<1> taken = (block_entry & (p1 | p2)) != hard<0>{};
 
         reuse_prediction(~val<1>{block_entry >> (LINEINST - 1)});
         return taken.fo1();
@@ -233,7 +210,7 @@ struct mpp : predictor {
 
     val<1> reuse_predict2([[maybe_unused]] val<64> inst_pc)
     {
-        val<1> taken = ((block_entry << block_size) & p2) != hard<0>{};
+        val<1> taken = ((block_entry << block_size) & (p1 | p2)) != hard<0>{};
 
         reuse_prediction(~val<1>{block_entry >> (LINEINST - 1 - block_size)});
         block_size++;
@@ -256,7 +233,7 @@ struct mpp : predictor {
         // Fanout fanned to LINEINST + 1 to cover both loop branches and block ending updates
         current_line_pc.fanout(hard<LINEINST+1>{});
         last_target_region.fanout(hard<LINEINST+1>{});
-        imli_counter.fanout(hard<LINEINST+1>{});
+        back_imli_counter.fanout(hard<LINEINST+1>{});
         mod_history.fanout(hard<LINEINST+1>{});
         mod_path.fanout(hard<LINEINST+1>{});
         blurry_path_history.fanout(hard<LINEINST+1>{});
@@ -384,11 +361,6 @@ struct mpp : predictor {
             // 1. IMLI Loop Update (using array of regs lookup and write)
             val<1> is_forward = next_pc > branch_pc;
 
-            execute_if(is_forward, [&](){
-                // Forward IMLI counter is incremented for not-taken forward branches, reset for taken forward branches
-                imli_counter = select(taken, val<IMLI_BITS>{0}, val<IMLI_BITS>{imli_counter.fo1() + 1});
-            });
-
             execute_if(~is_forward, [&](){
                 // Backward IMLI counter is incremented for taken backward branches, reset for not-taken backward branches
                 back_imli_counter = select(taken, val<IMLI_BITS>{back_imli_counter.fo1() + 1}, val<IMLI_BITS>{0});
@@ -402,12 +374,6 @@ struct mpp : predictor {
                 mod_path = (mod_path.fo1() << 1) | val<64>{branch_pc >> 2};
             });
 
-            
-            // 5. Target IMLI update
-            val<64> current_target_region = val<64>{next_pc >> TGT_IMLI_SHIFT};
-            current_target_region.fanout(hard<2>{});
-            // taIMLI increments the count if the target of the current backward taken branch is in the same region as the target of the last backward taken branch. It resets if the regions differ. 
-            ta_imli_counter = select(current_target_region == last_target_region, val<IMLI_BITS>{ta_imli_counter + 1}, val<IMLI_BITS>{0});
 
 
             // 6. ACYCLIC update: Write to acyclic_path array
