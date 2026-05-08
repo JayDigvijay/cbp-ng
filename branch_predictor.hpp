@@ -10,6 +10,7 @@
 #include "predictors/gshareN_ahead.hpp"
 #include "predictors/hashed_perceptron.hpp"
 #include "predictors/mpp.hpp"
+#include "predictors/gpp.hpp"
 #include "predictors/mpp_N_ahead.hpp"
 #include "predictors/tage_sc_l.hpp"
 #include "predictors/tutorial/tutorial.hpp"
