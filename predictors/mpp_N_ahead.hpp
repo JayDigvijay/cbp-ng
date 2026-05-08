@@ -42,7 +42,7 @@ struct mpp_N_ahead : predictor {
     static_assert(LOGG>(LOGLANES+LOGBANKS));
     static constexpr u64 index_bits = LOGG-(LOGLANES+LOGBANKS);
     // a block does not continue past a line boundary
-    static constexpr u64 LOGLINEINST = 10;
+    static constexpr u64 LOGLINEINST = 4;
     static constexpr u64 LINEINST = 1 << LOGLINEINST; // line size in instructions
 
     reg<GHIST> global_history;
@@ -135,8 +135,14 @@ struct mpp_N_ahead : predictor {
 
     val<1> predict1([[maybe_unused]] val<64> inst_pc)
     {
-        inst_pc.fanout(hard<4>{});
+        inst_pc.fanout(hard<LINEINST+1>{});
         true_block.fanout(hard<8+BANKS*2>{});
+        block_entry.fanout(hard<LINEINST+N+1>{});
+        rank.fanout(hard<N+2>{});
+        XL.fanout(hard<2*LANES + 2>{});
+        block_pred[0].fanout(hard<2>{});
+        block_pred[1].fanout(hard<2>{});
+        //index_bits.fanout(hard<2>{});
 
         // if the previous block was not a true block, we continue using the previous block predictions
         // (golden rule: never make a predictor's inputs depend on its outputs)
@@ -144,29 +150,32 @@ struct mpp_N_ahead : predictor {
         block_entry = select(true_block,
                              val<LOGLINEINST>{inst_pc>>2},
                              val<LOGLINEINST>{block_entry+block_size});
-        block_entry.fanout(hard<LINEINST+N+1>{});
+        
 
         rank = select(true_block, val<N+1>{1}, rank<<num_branch);
-        rank.fanout(hard<N+2>{});
+
 
         XL = select(true_block,
                     val<LOGLANES>{inst_pc>>6}.decode().concat(),
                     XL.rotate_left(num_branch));
-        XL.fanout(hard<LANES>{});
+
 
         execute_if(true_block, [&](){
+            index[0].fanout(hard<2>{});
+            unordered_pred.fanout(hard<LANES>{});
             index[1] = index[0];
+            global_history.fanout(hard<2>{});
             if constexpr (GHIST <= index_bits) {
                 val<index_bits> pc_bits = inst_pc >> (LOGBANKS+2);
                 index[0] = pc_bits ^ (val<index_bits>{global_history}<<(index_bits-GHIST));
             } else {
                 index[0] = global_history.make_array(val<index_bits>{}).fold_xor();
             }
+            index[0].fanout(hard<2>{});
             block_pred[1] = block_pred[0];
             block_pred[0] = ctr_hi.read(index[0]);
             path = XB + num_branch + ~last_condbr_dir;
             unordered_pred = block_pred[1].select(path);
-            unordered_pred.fanout(hard<LANES>{});
         });
 
         XB = select(true_block,
@@ -177,17 +186,18 @@ struct mpp_N_ahead : predictor {
             pred[i] = (unordered_pred & XL.rotate_left(i)) != hard<0>{};
         }
         p1 = pred.concat();
-        pred.fanout(hard<LINEINST*2>{});
+        p1.fanout(hard<LANES+1>{});
+        pred.fanout(hard<LINEINST + 2>{});
         block_size = 1;
         num_branch = 0;
-        reuse_prediction(~line_end());
+        //reuse_prediction(~line_end());
         return pred[num_branch];
     };
 
     val<1> reuse_predict1([[maybe_unused]] val<64> inst_pc)
     {
         block_size++;
-        reuse_prediction(~line_end());
+        //reuse_prediction(~line_end());
         return pred[num_branch];
     };
 
@@ -205,7 +215,7 @@ struct mpp_N_ahead : predictor {
                 index2[i] = lineaddr ^ gfolds.template get<0>(i-1);
             }
         }
-        index2.fanout(hard<2>{});
+        index2.fanout(hard<MPP_LINEINST+1>{});
 
         // read weights, then summed up
         for (u64 i=0; i<MPP_NTABLES; i++) {
@@ -232,7 +242,8 @@ struct mpp_N_ahead : predictor {
         val<1> taken = (block_entry & p2) != hard<0>{};
 
         // determine block termination
-        //reuse_prediction(~line_end());
+        reuse_prediction(~line_end());
+        //reuse_prediction(~val<1>{block_entry >> (MPP_LINEINST - 1)});
         return taken;
     }
 
@@ -242,7 +253,8 @@ struct mpp_N_ahead : predictor {
         val<1> taken = ((block_entry << block_size) & p2) != hard<0>{};
 
         // determine block termination
-        //reuse_prediction(~line_end());
+        reuse_prediction(~line_end());
+        //reuse_prediction(~val<1>{block_entry >> (MPP_LINEINST - 1)});
         block_size++;
         return taken;
     }
@@ -264,7 +276,7 @@ struct mpp_N_ahead : predictor {
     {
         val<1> &mispredict = block_end_info.is_mispredict;
         val<64> &next_pc = block_end_info.next_pc;
-        global_history.fanout(hard<N+1>{});
+        global_history.fanout(hard<N+2>{});
 
         if (num_branch == 0) {
             // no conditional branch in this block
@@ -278,7 +290,6 @@ struct mpp_N_ahead : predictor {
 
         /////// GSHARE Calculations //////////////
         static_assert(LANES<=64);
-        XL.fanout(hard<LANES+1>{});
         index[1].fanout(hard<2*LANES+1>{});
         mispredict.fanout(hard<LANES+2>{});
         path.fanout(hard<2*LANES+BANKS>{});
@@ -296,8 +307,8 @@ struct mpp_N_ahead : predictor {
 
         /////// MPP Calculations /////////
         branch_dir.fanout(hard<2>{});
-        branch_offset.fanout(hard<MPP_LINEINST>{});
-        index2.fanout(hard<MPP_LINEINST>{});
+        branch_offset.fanout(hard<MPP_LINEINST*2>{});
+        //index2.fanout(hard<MPP_LINEINST>{});
         yout.fanout(hard<3>{});
         theta_and_tc.fanout(hard<2>{});
         p2.fanout(hard<2>{});
@@ -352,7 +363,7 @@ struct mpp_N_ahead : predictor {
 
         // did P1 and P2 disagree?
         val<LANES> disagree_mask = (p1 ^ p2) & branch_mask;
-        disagree_mask.fanout(hard<2>{});
+        disagree_mask.fanout(hard<3>{});
         arr<val<1>,LANES> disagree = disagree_mask.make_array(val<1>{});
         disagree.fanout(hard<2>{});
 
